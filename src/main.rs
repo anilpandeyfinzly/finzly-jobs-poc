@@ -1,27 +1,20 @@
 //! finzly-jobs-poc — proof of concept for the new finzly-job-service.
 //!
 //! Boots like the real Phoenix services: load config, init the DB pool, run
-//! migrations, start Kafka (consumer + producer), then serve a minimal Axum
-//! app. Startup ordering mirrors phoenix-fedwire-workflow-processor-service
-//! and phoenix-workflow-service.
+//! migrations, then serve an axum app. Feature logic lives in its own modules
+//! (see `registration`).
 
-mod job;
+mod registration;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::Multipart;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::post;
-use axum::{Router, routing::get};
+use axum::{routing::get, Router};
 use tracing::info;
 
-use phoenix_config_sdk::config_properties::{get_config_property, get_configs};
+use phoenix_config_sdk::config_properties::get_configs;
+use phoenix_postgres_sdk::init_db_pool;
 use phoenix_postgres_sdk::tenant_config::run_migration;
-use phoenix_postgres_sdk::{get_tenant_pool, init_db_pool};
-
-// use crate::kafka::{build_publisher, start_jobs_consumer};
 
 const SERVICE_NAME: &str = "finzly-jobs-poc";
 
@@ -64,11 +57,11 @@ async fn async_main() -> Result<(), String> {
     } else {
         info!("Migrations disabled (spring.liquibase.enabled != true); skipping");
     }
-    
-    // 7. Minimal Axum server.
+
+    // 5. Axum server — feature routers are merged in here.
     let app = Router::new()
         .route("/ping", get(ping))
-        .route("/job/registrations", post(register_job));
+        .merge(registration::router());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     let listener = tokio::net::TcpListener::bind(addr)
@@ -98,127 +91,4 @@ fn migration_enabled() -> bool {
     //     })
     //     .unwrap_or(false)
     false
-}
-
-fn read_yaml_config(job_yaml: &str) -> serde_yaml::Result<job::Config> {
-    serde_yaml::from_str::<job::Config>(job_yaml)
-}
-
-async fn register_job(mut multipart: Multipart) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let field = multipart
-        .next_field()
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
-        .ok_or((StatusCode::BAD_REQUEST, "No file uploaded".to_string()))?;
-    if let Some(file_name) = field.file_name() {
-        println!("Uploaded file: {file_name}");
-        if !(file_name.ends_with(".yml") || file_name.ends_with(".yaml")) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "Only .yml or .yaml files are supported".to_string(),
-            ));
-        }
-    }
-
-    let yaml = field
-        .text()
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    // Parse the YAML
-    let config = read_yaml_config(&yaml)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid YAML: {e}")))?;
-
-    // Save registration to PostgreSQL (validation / event publishing still TODO).
-    let count = save_registration(&config)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("DB insert failed: {e}")))?;
-
-    println!(
-        "Registered {count} job(s) for service {}",
-        config.finzly.job.service
-    );
-
-    Ok((StatusCode::CREATED, format!("Registered {count} job(s)")))
-}
-
-/// Default tenant, resolved the same way `init_db_pool` does.
-fn default_tenant() -> String {
-    get_config_property("bankos.application.default.tenant")
-        .or_else(|| std::env::var("DEFAULT_TENANT_ID").ok())
-        .unwrap_or_else(|| "finzly".to_string())
-}
-
-/// Upsert every job in the parsed config into `job_registration`. Idempotent on
-/// `name` so re-registering the same service updates the existing rows. All jobs
-/// are written in a single transaction.
-async fn save_registration(config: &job::Config) -> Result<u64, sqlx::Error> {
-    let tenant = default_tenant();
-    let pool = get_tenant_pool(&tenant)
-        .await
-        .map_err(|e| sqlx::Error::Configuration(e.to_string().into()))?;
-
-    let contract_version = &config.finzly.job.contract_version;
-    let jobs = &config.finzly.job.jobs;
-
-    let mut tx = pool.begin().await?;
-    for job in jobs {
-        sqlx::query(
-            r#"
-            INSERT INTO job_registration
-                (name, cron, trigger_type, callback_bean, callback_endpoint, event_topic,
-                 status_report_mode, interval_seconds, sla_seconds, timeout_seconds,
-                 max_retries, contract_version)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-            ON CONFLICT (name) DO UPDATE SET
-                cron               = EXCLUDED.cron,
-                trigger_type       = EXCLUDED.trigger_type,
-                callback_bean      = EXCLUDED.callback_bean,
-                callback_endpoint  = EXCLUDED.callback_endpoint,
-                event_topic        = EXCLUDED.event_topic,
-                status_report_mode = EXCLUDED.status_report_mode,
-                interval_seconds   = EXCLUDED.interval_seconds,
-                sla_seconds        = EXCLUDED.sla_seconds,
-                timeout_seconds    = EXCLUDED.timeout_seconds,
-                max_retries        = EXCLUDED.max_retries,
-                contract_version   = EXCLUDED.contract_version,
-                updated_at         = now()
-            "#,
-        )
-        .bind(job.name.as_str())
-        .bind(job.cron.as_deref())
-        .bind(job.trigger_type.as_str())
-        .bind(job.callback_bean.as_str())
-        .bind(job.callback_endpoint.as_deref())
-        .bind(job.event_topic.as_deref())
-        .bind(job.status_report.mode.as_str())
-        .bind(job.status_report.interval_seconds.map(|v| v as i32))
-        .bind(job.sla_seconds as i32)
-        .bind(job.timeout_seconds as i32)
-        .bind(job.max_retries as i32)
-        .bind(contract_version.as_str())
-        .execute(&mut *tx)
-        .await?;
-    }
-    tx.commit().await?;
-
-    Ok(jobs.len() as u64)
-}
-
-#[cfg(test)]
-mod tests {
-    use tokio::fs::read_to_string;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn yml_test() {
-        let read_data = read_to_string("../job-config.yml").await.unwrap();
-        let read_yml = read_yaml_config(read_data.as_str());
-
-        assert!(read_yml.is_ok());
-        let yml_data = read_yml.unwrap();
-
-        println!("test:: {:?}", yml_data);
-        assert_eq!(yml_data.finzly.job.service, "settlement-service");
-    }
 }
