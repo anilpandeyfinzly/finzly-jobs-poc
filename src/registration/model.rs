@@ -1,3 +1,5 @@
+//! Data structures mapping the finzly `job-config.yml` registration contract.
+
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
