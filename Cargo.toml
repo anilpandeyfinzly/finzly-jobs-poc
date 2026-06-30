@@ -1,0 +1,24 @@
+[package]
+name = "finzly-jobs-poc"
+version = "0.1.0"
+edition = "2024"
+publish = ["finzly-finzly-rust-hosted"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["multipart"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "migrate", "chrono"] }
+serde = { version = "1.0", features = ["derive"], registry = "finzly-finzly-rust-hosted" }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+dotenvy = "0.15"
+anyhow = "1"
+async-trait = "0.1"
+
+# Phoenix common SDKs (local path deps — see plan)
+phoenix-config-sdk   = { path = "../../finzlyprojects/phoenix-common/phoenix-config-sdk" }
+phoenix-postgres-sdk = { path = "../../finzlyprojects/phoenix-common/phoenix-postgres-sdk" }
+phoenix-kafka-sdk    = { path = "../../finzlyprojects/phoenix-common/phoenix-kafka-sdk" }
+phoenix-security-sdk = { path = "../../finzlyprojects/phoenix-common/phoenix-security-sdk" }
+serde_yaml = { version = "0.9.34", registry = "finzly-finzly-rust-hosted" }
