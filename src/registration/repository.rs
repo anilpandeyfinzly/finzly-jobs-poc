@@ -6,7 +6,7 @@ use phoenix_postgres_sdk::get_tenant_pool;
 use super::model::Config;
 
 /// Default tenant, resolved the same way `init_db_pool` does.
-fn default_tenant() -> String {
+pub fn default_tenant() -> String {
     get_config_property("bankos.application.default.tenant")
         .or_else(|| std::env::var("DEFAULT_TENANT_ID").ok())
         .unwrap_or_else(|| "finzly".to_string())

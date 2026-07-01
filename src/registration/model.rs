@@ -96,3 +96,26 @@ impl StatusReportMode {
         }
     }
 }
+
+
+use chrono::{DateTime, Utc};
+use sqlx::FromRow;
+
+#[derive(Debug, FromRow)]
+pub struct JobRow {
+    pub id: i64,
+    pub name: String,
+    pub cron: Option<String>,
+    pub trigger_type: String,
+    pub callback_bean: String,
+    pub callback_endpoint: Option<String>,
+    pub event_topic: Option<String>,
+    pub status_report_mode: String,
+    pub interval_seconds: Option<i32>,
+    pub sla_seconds: i32,
+    pub timeout_seconds: i32,
+    pub max_retries: i32,
+    pub contract_version: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
