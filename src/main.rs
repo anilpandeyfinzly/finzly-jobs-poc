@@ -5,6 +5,7 @@
 //! (see `registration`).
 
 mod registration;
+mod orchestrator;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -58,7 +59,10 @@ async fn async_main() -> Result<(), String> {
         info!("Migrations disabled (spring.liquibase.enabled != true); skipping");
     }
 
-    // 5. Axum server — feature routers are merged in here.
+    // 5. Start the background job orchestrator (scheduler -> dispatcher -> executor).
+    orchestrator::init_orchestrator();
+
+    // 6. Axum server — feature routers are merged in here.
     let app = Router::new()
         .route("/ping", get(ping))
         .merge(registration::router());
