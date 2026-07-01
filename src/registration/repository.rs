@@ -26,13 +26,20 @@ pub async fn save_registration(config: &Config) -> Result<u64, sqlx::Error> {
 
     let mut tx = pool.begin().await?;
     for job in jobs {
+        // Cron-driven schedule: the first fire is the next cron occurrence.
+        // interval_seconds is only the status-report cadence, not the schedule.
+        let next_fire_time = job
+            .cron
+            .as_deref()
+            .and_then(crate::orchestrator::schedule::next_fire_from_now);
+
         sqlx::query(
             r#"
             INSERT INTO job_registration
                 (name, cron, trigger_type, callback_bean, callback_endpoint, event_topic,
                  status_report_mode, interval_seconds, sla_seconds, timeout_seconds,
-                 max_retries, contract_version)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 max_retries, contract_version, next_fire_time)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (name) DO UPDATE SET
                 cron               = EXCLUDED.cron,
                 trigger_type       = EXCLUDED.trigger_type,
@@ -45,6 +52,7 @@ pub async fn save_registration(config: &Config) -> Result<u64, sqlx::Error> {
                 timeout_seconds    = EXCLUDED.timeout_seconds,
                 max_retries        = EXCLUDED.max_retries,
                 contract_version   = EXCLUDED.contract_version,
+                next_fire_time     = EXCLUDED.next_fire_time,
                 updated_at         = now()
             "#,
         )
@@ -60,6 +68,7 @@ pub async fn save_registration(config: &Config) -> Result<u64, sqlx::Error> {
         .bind(job.timeout_seconds as i32)
         .bind(job.max_retries as i32)
         .bind(contract_version.as_str())
+        .bind(next_fire_time)
         .execute(&mut *tx)
         .await?;
     }
