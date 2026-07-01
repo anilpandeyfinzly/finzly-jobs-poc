@@ -7,6 +7,7 @@
 
 pub mod dispatcher;
 pub mod executor;
+pub mod schedule;
 pub mod scheduler;
 
 use std::sync::OnceLock;

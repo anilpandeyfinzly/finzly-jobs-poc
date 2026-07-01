@@ -26,3 +26,4 @@ phoenix-model-sdk =  { version = "=1.1.2" }
 phoenix-workflow-client = { version = "=1.1.46" }
 serde_yaml = { version = "0.9.34" }
 chrono = { version = "0.4.45", default-features = false, features = ["std", "serde"] }
+cron = "0.12"
