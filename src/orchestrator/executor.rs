@@ -1,57 +1,100 @@
-//! Executor: performs a fired job. POC behaviour — log the fire and record a
-//! `job_execution` row. Routing to real triggers (HTTP callback for API jobs,
-//! Kafka publish for EVENT jobs) is future work.
-
-use std::time::{SystemTime, UNIX_EPOCH};
+//! Executor: performs a fired trigger. POC behaviour — log the fire, open a
+//! `flow_execution`, and record a `job_execution` row per job in the flow.
+//! Routing to real triggers (HTTP callback for API jobs, Kafka publish for EVENT
+//! jobs) is future work; here every job is marked SUCCESS (log-only).
 
 use tracing::info;
+use uuid::Uuid;
 
 use phoenix_postgres_sdk::get_tenant_pool;
 
-use crate::registration::{model::JobRow, repository::default_tenant};
+use crate::registration::model::ClaimedTrigger;
 
 pub struct Executor;
 
 impl Executor {
-    pub async fn execute(job: &JobRow) -> Result<(), sqlx::Error> {
+    pub async fn execute(trigger: &ClaimedTrigger) -> Result<(), sqlx::Error> {
+        let job_names = trigger.job_names();
         info!(
-            job = %job.name,
-            trigger_type = %job.trigger_type,
-            event_topic = ?job.event_topic,
-            callback_endpoint = ?job.callback_endpoint,
-            "Job fired"
+            flow = %trigger.flow_name,
+            flow_version = trigger.flow_version,
+            scheduled_fire_time = %trigger.scheduled_fire_time,
+            jobs = ?job_names,
+            "Flow fired"
         );
 
-        // TODO: route by trigger_type — API -> HTTP POST callback_endpoint,
-        // EVENT -> publish to event_topic. For now we only record the execution.
-        record_execution(job).await
+        record_execution(trigger, &job_names).await
     }
 }
 
-/// Insert a `job_execution` row marking a successful (log-only) fire.
-async fn record_execution(job: &JobRow) -> Result<(), sqlx::Error> {
-    let tenant = default_tenant();
-    let pool = get_tenant_pool(&tenant)
+/// Open a `flow_execution` for this fire (idempotent on the per-fire key) and
+/// record one `job_execution` per job, then mark the flow SUCCESS. If the fire
+/// was already recorded (idempotency conflict), this is a no-op.
+async fn record_execution(
+    trigger: &ClaimedTrigger,
+    job_names: &[String],
+) -> Result<(), sqlx::Error> {
+    let pool = get_tenant_pool(&trigger.tenant_name)
         .await
         .map_err(|e| sqlx::Error::Configuration(e.to_string().into()))?;
 
-    // Unique-per-fire id without pulling in uuid/chrono-clock: epoch nanos.
-    let execution_id = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos().to_string())
-        .unwrap_or_else(|_| "0".to_string());
+    let mut tx = pool.begin().await?;
+
+    // One flow_execution per fire. ON CONFLICT (idempotency_key) DO NOTHING means
+    // a re-delivered fire returns no row, and we skip it.
+    let flow_execution_id: Option<Uuid> = sqlx::query_scalar(
+        r#"
+        INSERT INTO demo_galaxy_jobs.flow_execution
+            (flow_definition_id, flow_version, scheduled_fire_time, idempotency_key,
+             status, started_at)
+        VALUES ($1, $2, $3, $4, 'IN_PROGRESS', now())
+        ON CONFLICT (idempotency_key) DO NOTHING
+        RETURNING id
+        "#,
+    )
+    .bind(trigger.flow_definition_id)
+    .bind(trigger.flow_version)
+    .bind(trigger.scheduled_fire_time)
+    .bind(trigger.idempotency_key())
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(flow_execution_id) = flow_execution_id else {
+        info!(
+            flow = %trigger.flow_name,
+            idempotency_key = %trigger.idempotency_key(),
+            "Fire already recorded; skipping (idempotent)"
+        );
+        tx.commit().await?;
+        return Ok(());
+    };
+
+    // POC: log-only run of each job in the flow, all SUCCESS.
+    for job_name in job_names {
+        sqlx::query(
+            r#"
+            INSERT INTO demo_galaxy_jobs.job_execution
+                (flow_execution_id, job_name, status, attempt, started_at, ended_at)
+            VALUES ($1, $2, 'SUCCESS', 1, now(), now())
+            "#,
+        )
+        .bind(flow_execution_id)
+        .bind(job_name.as_str())
+        .execute(&mut *tx)
+        .await?;
+    }
 
     sqlx::query(
         r#"
-        INSERT INTO demo_galaxy_jobs.job_execution
-            (job_name, execution_id, status, started_at, finished_at)
-        VALUES ($1, $2, 'SUCCESS', now(), now())
+        UPDATE demo_galaxy_jobs.flow_execution
+        SET status = 'SUCCESS', ended_at = now(), updated_at = now()
+        WHERE id = $1
         "#,
     )
-    .bind(job.name.as_str())
-    .bind(execution_id)
-    .execute(&pool)
+    .bind(flow_execution_id)
+    .execute(&mut *tx)
     .await?;
 
+    tx.commit().await?;
     Ok(())
 }

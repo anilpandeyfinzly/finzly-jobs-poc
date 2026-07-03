@@ -18,16 +18,16 @@ use phoenix_config_sdk::config_properties::get_config_property;
 use phoenix_postgres_sdk::get_tenant_pool;
 
 use super::schedule::next_fire_from_now;
-use crate::registration::{model::JobRow, repository::default_tenant};
+use crate::registration::{model::ClaimedTrigger, repository::default_tenant};
 
 pub struct Scheduler {
-    sender: Sender<JobRow>,
+    sender: Sender<ClaimedTrigger>,
     poll_interval_secs: u64,
     claim_batch: i64,
 }
 
 impl Scheduler {
-    pub fn new(sender: Sender<JobRow>) -> Self {
+    pub fn new(sender: Sender<ClaimedTrigger>) -> Self {
         let poll_interval_secs = get_config_property("bankos.scheduler.poll.interval")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(5);
@@ -54,12 +54,12 @@ impl Scheduler {
 
             loop {
                 match self.claim_due_jobs().await {
-                    Ok(jobs) if !jobs.is_empty() => {
-                        debug!(count = jobs.len(), "Scheduler claimed due jobs");
-                        for job in jobs {
-                            let job_name = job.name.clone();
-                            if let Err(e) = self.sender.try_send(job) {
-                                error!(job = %job_name, error = %e, "Failed to enqueue claimed job");
+                    Ok(triggers) if !triggers.is_empty() => {
+                        debug!(count = triggers.len(), "Scheduler claimed due triggers");
+                        for trigger in triggers {
+                            let flow = trigger.flow_name.clone();
+                            if let Err(e) = self.sender.try_send(trigger) {
+                                error!(flow = %flow, error = %e, "Failed to enqueue claimed trigger");
                             }
                         }
                     }
@@ -71,10 +71,12 @@ impl Scheduler {
         });
     }
 
-    /// Claim due jobs concurrency-safely (multi-pod). In a single transaction:
-    /// select due rows with `FOR UPDATE SKIP LOCKED`, then advance each row's
-    /// `next_fire_time` to the next cron occurrence so it isn't re-claimed.
-    pub async fn claim_due_jobs(&self) -> Result<Vec<JobRow>, sqlx::Error> {
+    /// Claim due triggers concurrency-safely (multi-pod). In a single transaction:
+    /// select due `scheduled_trigger` rows (joined to their enabled flow) with
+    /// `FOR UPDATE SKIP LOCKED`, then advance each trigger's `next_fire_time` to
+    /// the next cron occurrence so it isn't re-claimed. The `scheduled_fire_time`
+    /// captured here is the instant the fire represents.
+    pub async fn claim_due_jobs(&self) -> Result<Vec<ClaimedTrigger>, sqlx::Error> {
         let tenant = default_tenant();
         let pool = get_tenant_pool(&tenant)
             .await
@@ -82,14 +84,25 @@ impl Scheduler {
 
         let mut tx = pool.begin().await?;
 
-        let jobs: Vec<JobRow> = sqlx::query_as::<_, JobRow>(
+        let triggers: Vec<ClaimedTrigger> = sqlx::query_as::<_, ClaimedTrigger>(
             r#"
-            SELECT * FROM demo_galaxy_jobs.job_registration
-            WHERE cron IS NOT NULL
-              AND next_fire_time IS NOT NULL
-              AND next_fire_time <= now()
-            ORDER BY next_fire_time
-            FOR UPDATE SKIP LOCKED
+            SELECT
+                st.id                 AS trigger_id,
+                st.tenant_name        AS tenant_name,
+                st.flow_definition_id AS flow_definition_id,
+                st.cron_expression    AS cron_expression,
+                st.next_fire_time     AS scheduled_fire_time,
+                fd.name               AS flow_name,
+                fd.version            AS flow_version,
+                fd.flow               AS flow
+            FROM demo_galaxy_jobs.scheduled_trigger st
+            JOIN demo_galaxy_jobs.flow_definition fd
+              ON fd.id = st.flow_definition_id
+            WHERE st.next_fire_time IS NOT NULL
+              AND st.next_fire_time <= now()
+              AND fd.is_enabled = true
+            ORDER BY st.next_fire_time
+            FOR UPDATE OF st SKIP LOCKED
             LIMIT $1
             "#,
         )
@@ -97,20 +110,21 @@ impl Scheduler {
         .fetch_all(&mut *tx)
         .await?;
 
-        for job in &jobs {
+        for trigger in &triggers {
             // Advance to the next cron occurrence so it won't fire again until due.
-            let next = job.cron.as_deref().and_then(next_fire_from_now);
+            let next = next_fire_from_now(&trigger.cron_expression).map(|dt| dt.naive_utc());
             sqlx::query(
-                "UPDATE demo_galaxy_jobs.job_registration \
-                 SET next_fire_time = $1, updated_at = now() WHERE name = $2",
+                "UPDATE demo_galaxy_jobs.scheduled_trigger \
+                 SET next_fire_time = $1, last_fire_time = now(), updated_at = now() \
+                 WHERE id = $2",
             )
             .bind(next)
-            .bind(job.name.as_str())
+            .bind(trigger.trigger_id)
             .execute(&mut *tx)
             .await?;
         }
 
         tx.commit().await?;
-        Ok(jobs)
+        Ok(triggers)
     }
 }

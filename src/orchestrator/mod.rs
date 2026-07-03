@@ -17,7 +17,7 @@ use tracing::info;
 
 use phoenix_config_sdk::config_properties::get_config_property;
 
-use crate::registration::model::JobRow;
+use crate::registration::model::ClaimedTrigger;
 use dispatcher::Dispatcher;
 use scheduler::Scheduler;
 
@@ -35,7 +35,7 @@ pub fn init_orchestrator() {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(10_000);
 
-    let (sender, receiver) = mpsc::channel::<JobRow>(capacity);
+    let (sender, receiver) = mpsc::channel::<ClaimedTrigger>(capacity);
 
     Dispatcher::new(receiver).start();
     Scheduler::new(sender).start();

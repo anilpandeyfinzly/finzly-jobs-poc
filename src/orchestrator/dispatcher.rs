@@ -5,14 +5,14 @@ use tokio::sync::mpsc::Receiver;
 use tracing::{error, info};
 
 use super::executor::Executor;
-use crate::registration::model::JobRow;
+use crate::registration::model::ClaimedTrigger;
 
 pub struct Dispatcher {
-    receiver: Receiver<JobRow>,
+    receiver: Receiver<ClaimedTrigger>,
 }
 
 impl Dispatcher {
-    pub fn new(receiver: Receiver<JobRow>) -> Self {
+    pub fn new(receiver: Receiver<ClaimedTrigger>) -> Self {
         Self { receiver }
     }
 
@@ -21,9 +21,9 @@ impl Dispatcher {
     pub fn start(mut self) {
         tokio::spawn(async move {
             info!("Dispatcher started");
-            while let Some(job) = self.receiver.recv().await {
-                if let Err(e) = Executor::execute(&job).await {
-                    error!(job = %job.name, error = %e, "Executor failed");
+            while let Some(trigger) = self.receiver.recv().await {
+                if let Err(e) = Executor::execute(&trigger).await {
+                    error!(flow = %trigger.flow_name, error = %e, "Executor failed");
                 }
             }
             info!("Dispatcher channel closed; stopping");
