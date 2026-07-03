@@ -54,6 +54,9 @@ pub async fn save_registration(config: &Config) -> Result<u64, sqlx::Error> {
         // 2. job_definition — the reusable unit of work. The transport-only
         //    contract fields live in parameters; retry policy is its own column.
         let parameters = json!({
+            // Concurrency policy for dispatch. The YAML contract has no such field,
+            // so scheduled jobs default to SKIP (never run two at once).
+            "concurrency": "SKIP",
             "serviceBaseUrl": job_cfg.service_base_url,
             "callbackBean": job.callback_bean,
             "callbackEndpoint": job.callback_endpoint,

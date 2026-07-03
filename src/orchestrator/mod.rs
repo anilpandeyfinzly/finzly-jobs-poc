@@ -5,11 +5,13 @@
 //! those and runs each flow via the `Executor`. Producer and consumer are decoupled
 //! by Kafka, so they can run in the same process (this POC) or across pods.
 
+pub mod completion;
 pub mod consumer;
 pub mod executor;
 pub mod messages;
 pub mod schedule;
 pub mod scheduler;
+pub mod worker;
 
 use std::sync::OnceLock;
 
