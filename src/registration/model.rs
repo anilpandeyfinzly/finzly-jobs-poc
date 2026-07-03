@@ -71,7 +71,7 @@ pub enum TriggerType {
 }
 
 impl TriggerType {
-    /// Canonical string stored in the DB (job_registration.trigger_type).
+    /// Canonical string stored as job_definition.job_type.
     pub fn as_str(&self) -> &'static str {
         match self {
             TriggerType::API => "API",
@@ -88,7 +88,7 @@ pub enum StatusReportMode {
 }
 
 impl StatusReportMode {
-    /// Canonical string stored in the DB (job_registration.status_report_mode).
+    /// Canonical string stored inside job_definition.parameters (statusReport.mode).
     pub fn as_str(&self) -> &'static str {
         match self {
             StatusReportMode::FIXEDTIME => "FIXED_TIME",
@@ -98,24 +98,49 @@ impl StatusReportMode {
 }
 
 
-use chrono::{DateTime, Utc};
+use chrono::NaiveDateTime;
+use serde_json::Value as JsonValue;
 use sqlx::FromRow;
+use uuid::Uuid;
 
-#[derive(Debug, FromRow)]
-pub struct JobRow {
-    pub id: i64,
-    pub name: String,
-    pub cron: Option<String>,
-    pub trigger_type: String,
-    pub callback_bean: String,
-    pub callback_endpoint: Option<String>,
-    pub event_topic: Option<String>,
-    pub status_report_mode: String,
-    pub interval_seconds: Option<i32>,
-    pub sla_seconds: i32,
-    pub timeout_seconds: i32,
-    pub max_retries: i32,
-    pub contract_version: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+/// A due `scheduled_trigger` joined to its `flow_definition`, as claimed by the
+/// scheduler and carried over the channel to the executor. The executor uses it
+/// to open a `flow_execution` and record a `job_execution` per job in the flow.
+#[derive(Debug, Clone, FromRow)]
+pub struct ClaimedTrigger {
+    /// scheduled_trigger.id
+    pub trigger_id: Uuid,
+    pub tenant_name: String,
+    pub flow_definition_id: Uuid,
+    pub cron_expression: String,
+    /// The fire instant this claim represents (the trigger's next_fire_time at
+    /// claim time). Feeds flow_execution.scheduled_fire_time + the idempotency key.
+    pub scheduled_fire_time: NaiveDateTime,
+    /// flow_definition.name — for logging.
+    pub flow_name: String,
+    /// flow_definition.version — pinned onto the flow_execution.
+    pub flow_version: i32,
+    /// flow_definition.flow — the DAG. POC shape: {"jobs": ["<name>", ...]}.
+    pub flow: JsonValue,
+}
+
+impl ClaimedTrigger {
+    /// Job names declared in the flow JSON (`{"jobs": [...]}`); empty if malformed.
+    pub fn job_names(&self) -> Vec<String> {
+        self.flow
+            .get("jobs")
+            .and_then(JsonValue::as_array)
+            .map(|jobs| {
+                jobs.iter()
+                    .filter_map(|j| j.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Deterministic per-fire key so re-delivery of the same fire is deduped by
+    /// flow_execution's unique index on idempotency_key.
+    pub fn idempotency_key(&self) -> String {
+        format!("{}:{}", self.flow_definition_id, self.scheduled_fire_time)
+    }
 }
