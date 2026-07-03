@@ -10,24 +10,24 @@
 
 use std::time::Duration;
 
-use tokio::sync::mpsc::Sender;
 use tokio::time::sleep;
 use tracing::{debug, error, info};
 
 use phoenix_config_sdk::config_properties::get_config_property;
 use phoenix_postgres_sdk::get_tenant_pool;
 
+use super::messages::FlowExecutionRequested;
 use super::schedule::next_fire_from_now;
+use crate::kafka;
 use crate::registration::{model::ClaimedTrigger, repository::default_tenant};
 
 pub struct Scheduler {
-    sender: Sender<ClaimedTrigger>,
     poll_interval_secs: u64,
     claim_batch: i64,
 }
 
 impl Scheduler {
-    pub fn new(sender: Sender<ClaimedTrigger>) -> Self {
+    pub fn new() -> Self {
         let poll_interval_secs = get_config_property("bankos.scheduler.poll.interval")
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(5);
@@ -35,7 +35,6 @@ impl Scheduler {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(50);
         Self {
-            sender,
             poll_interval_secs,
             claim_batch,
         }
@@ -57,10 +56,7 @@ impl Scheduler {
                     Ok(triggers) if !triggers.is_empty() => {
                         debug!(count = triggers.len(), "Scheduler claimed due triggers");
                         for trigger in triggers {
-                            let flow = trigger.flow_name.clone();
-                            if let Err(e) = self.sender.try_send(trigger) {
-                                error!(flow = %flow, error = %e, "Failed to enqueue claimed trigger");
-                            }
+                            Self::publish_flow_requested(&trigger).await;
                         }
                     }
                     Ok(_) => {}
@@ -85,7 +81,7 @@ impl Scheduler {
         let mut tx = pool.begin().await?;
 
         // The trigger references the flow by name (master-DB table); resolve it to
-        // the enabled flow's latest version to get the id/version/flow DAG.
+        // the enabled flow's latest version to get its id for the request message.
         let triggers: Vec<ClaimedTrigger> = sqlx::query_as::<_, ClaimedTrigger>(
             r#"
             SELECT
@@ -94,9 +90,7 @@ impl Scheduler {
                 fd.id              AS flow_definition_id,
                 st.cron_expression AS cron_expression,
                 st.next_fire_time  AS scheduled_fire_time,
-                fd.name            AS flow_name,
-                fd.version         AS flow_version,
-                fd.flow            AS flow
+                fd.name            AS flow_name
             FROM demo_galaxy_jobs.scheduled_trigger st
             JOIN demo_galaxy_jobs.flow_definition fd
               ON fd.name = st.flow_definition_name
@@ -133,5 +127,28 @@ impl Scheduler {
 
         tx.commit().await?;
         Ok(triggers)
+    }
+
+    /// Publish a `flow.execution.requested` for a claimed trigger. Keyed by the
+    /// flow definition id; errors are logged (the trigger already advanced, so the
+    /// next fire is unaffected).
+    async fn publish_flow_requested(trigger: &ClaimedTrigger) {
+        let msg = FlowExecutionRequested {
+            flow_definition_id: trigger.flow_definition_id,
+            tenant_name: trigger.tenant_name.clone(),
+            schedule_fire_time: trigger.scheduled_fire_time,
+        };
+        let key = trigger.flow_definition_id.to_string();
+        if let Err(e) = kafka::publish(
+            &kafka::topic_flow_requested(),
+            &key,
+            &trigger.tenant_name,
+            false,
+            &msg,
+        )
+        .await
+        {
+            error!(flow = %trigger.flow_name, error = %e, "Failed to publish flow.execution.requested");
+        }
     }
 }

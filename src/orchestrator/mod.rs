@@ -1,44 +1,35 @@
 //! Background job orchestrator.
 //!
-//! Mirrors the payment-event pipeline: an init-once entry point wires a bounded
-//! channel between a producer (the `Scheduler`, which polls the DB for due jobs)
-//! and a consumer (the `Dispatcher`, which drains the channel and runs each job
-//! via the `Executor`). Both run as background tokio tasks.
+//! Kafka-driven pipeline: the `Scheduler` (producer) polls the DB for due triggers
+//! and publishes `flow.execution.requested`; the orchestrator `consumer` receives
+//! those and runs each flow via the `Executor`. Producer and consumer are decoupled
+//! by Kafka, so they can run in the same process (this POC) or across pods.
 
-pub mod dispatcher;
+pub mod consumer;
 pub mod executor;
+pub mod messages;
 pub mod schedule;
 pub mod scheduler;
 
 use std::sync::OnceLock;
 
-use tokio::sync::mpsc;
 use tracing::info;
 
-use phoenix_config_sdk::config_properties::get_config_property;
-
-use crate::registration::model::ClaimedTrigger;
-use dispatcher::Dispatcher;
 use scheduler::Scheduler;
 
 /// Guards against double initialization (like the payment system's OnceCell).
 static ORCHESTRATOR: OnceLock<()> = OnceLock::new();
 
-/// Initialize the orchestrator once: wire the channel and start the dispatcher
-/// (consumer) and scheduler (producer). Call at startup after the DB pool is ready.
+/// Initialize the orchestrator once: start the scheduler (publishes due flows) and
+/// the Kafka consumer (runs them). Call at startup after the DB pool and Kafka
+/// publisher are ready.
 pub fn init_orchestrator() {
     if ORCHESTRATOR.set(()).is_err() {
         return; // already initialized
     }
 
-    let capacity = get_config_property("bankos.scheduler.channel.capacity")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(10_000);
+    consumer::start();
+    Scheduler::new().start();
 
-    let (sender, receiver) = mpsc::channel::<ClaimedTrigger>(capacity);
-
-    Dispatcher::new(receiver).start();
-    Scheduler::new(sender).start();
-
-    info!(channel_capacity = capacity, "Orchestrator initialized");
+    info!("Orchestrator initialized");
 }

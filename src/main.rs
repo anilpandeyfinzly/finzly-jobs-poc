@@ -4,6 +4,7 @@
 //! migrations, then serve an axum app. Feature logic lives in its own modules
 //! (see `registration`).
 
+mod kafka;
 mod registration;
 mod orchestrator;
 
@@ -59,10 +60,15 @@ async fn async_main() -> Result<(), String> {
         info!("Migrations disabled (spring.liquibase.enabled != true); skipping");
     }
 
-    // 5. Start the background job orchestrator (scheduler -> dispatcher -> executor).
+    // 5. Kafka publisher — the scheduler and orchestrator publish through it.
+    kafka::init_publisher()?;
+    info!("Kafka publisher initialized successfully");
+
+    // 6. Start the background job orchestrator (scheduler publishes due flows over
+    //    Kafka; the orchestrator consumer receives them and runs the executor).
     orchestrator::init_orchestrator();
 
-    // 6. Axum server — feature routers are merged in here.
+    // 7. Axum server — feature routers are merged in here.
     let app = Router::new()
         .route("/ping", get(ping))
         .merge(registration::router());
