@@ -45,16 +45,14 @@ async fn record_execution(
     let flow_execution_id: Option<Uuid> = sqlx::query_scalar(
         r#"
         INSERT INTO demo_galaxy_jobs.flow_execution
-            (flow_definition_id, flow_version, scheduled_fire_time, idempotency_key,
-             status, started_at)
-        VALUES ($1, $2, $3, $4, 'IN_PROGRESS', now())
+            (flow_definition_id, flow_version, idempotency_key, status, started_at)
+        VALUES ($1, $2, $3, 'IN_PROGRESS', now())
         ON CONFLICT (idempotency_key) DO NOTHING
         RETURNING id
         "#,
     )
     .bind(trigger.flow_definition_id)
     .bind(trigger.flow_version)
-    .bind(trigger.scheduled_fire_time)
     .bind(trigger.idempotency_key())
     .fetch_optional(&mut *tx)
     .await?;

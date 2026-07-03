@@ -8,6 +8,7 @@
 --   scheduled_trigger -- cron schedule that fires a flow_definition (per tenant)
 --   flow_execution    -- one run of a flow_definition (idempotent per fire)
 --   job_execution     -- one run of a job within a flow_execution
+--   execution_lock    -- "job already running?" guard for concurrency policies
 --
 -- Timestamps use TIMESTAMP (without time zone) and structured columns use JSONB.
 -- Idempotent so re-running migrations is safe.
@@ -33,7 +34,7 @@ CREATE TABLE IF NOT EXISTS demo_galaxy_jobs.job_definition (
     name            VARCHAR(128) NOT NULL,
     description     VARCHAR(512),
     job_type        VARCHAR(64)  NOT NULL,
-    target_service  VARCHAR(128) NOT NULL,
+    service_context VARCHAR(128) NOT NULL,
     parameters      JSONB,
     retry_policy    JSONB,
     created_at      TIMESTAMP  NOT NULL DEFAULT now(),
@@ -61,33 +62,32 @@ CREATE TABLE IF NOT EXISTS demo_galaxy_jobs.flow_definition (
 );
 
 -- --- scheduled_trigger: cron schedule that fires a flow_definition, per tenant. ---
--- Cron can't be evaluated in SQL, so next_fire_time (computed in Rust) drives the
--- claim query `next_fire_time <= now() ... FOR UPDATE SKIP LOCKED` (see 0002).
+-- This is the master scheduler table: it lives in the finzly (common) DB shared
+-- across tenants, so it references the flow by NAME (flow_definition_name), not a
+-- cross-DB UUID FK. Cron can't be evaluated in SQL, so next_fire_time (computed in
+-- Rust) drives the claim query `next_fire_time <= now() ... FOR UPDATE SKIP LOCKED`.
 CREATE TABLE IF NOT EXISTS demo_galaxy_jobs.scheduled_trigger (
-    id                  UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_name         VARCHAR(64)  NOT NULL,
-    flow_definition_id  UUID         NOT NULL REFERENCES demo_galaxy_jobs.flow_definition(id),
-    cron_expression     VARCHAR(64)  NOT NULL,
-    next_fire_time      TIMESTAMP,
-    last_fire_time      TIMESTAMP,
-    created_by          VARCHAR(128),
-    created_at          TIMESTAMP  NOT NULL DEFAULT now(),
-    updated_at          TIMESTAMP  NOT NULL DEFAULT now(),
+    id                    UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_name           VARCHAR(64)  NOT NULL,
+    flow_definition_name  VARCHAR(128) NOT NULL,
+    cron_expression       VARCHAR(64)  NOT NULL,
+    next_fire_time        TIMESTAMP,
+    last_fire_time        TIMESTAMP,
+    created_by            VARCHAR(128),
+    created_at            TIMESTAMP  NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMP  NOT NULL DEFAULT now(),
     -- One trigger per (tenant, flow); lets registration upsert on re-upload.
-    UNIQUE (tenant_name, flow_definition_id)
+    UNIQUE (tenant_name, flow_definition_name)
 );
 
 CREATE INDEX IF NOT EXISTS idx_scheduled_trigger_next_fire_time
     ON demo_galaxy_jobs.scheduled_trigger (next_fire_time);
-CREATE INDEX IF NOT EXISTS idx_scheduled_trigger_flow_definition_id
-    ON demo_galaxy_jobs.scheduled_trigger (flow_definition_id);
 
 -- --- flow_execution: one run of a flow_definition. ---
 CREATE TABLE IF NOT EXISTS demo_galaxy_jobs.flow_execution (
     id                   UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
     flow_definition_id   UUID         NOT NULL REFERENCES demo_galaxy_jobs.flow_definition(id),
     flow_version         INTEGER      NOT NULL,
-    scheduled_fire_time  TIMESTAMP,
     idempotency_key      VARCHAR(255),
     status               VARCHAR(24)  NOT NULL DEFAULT 'SCHEDULED', -- SCHEDULED|IN_PROGRESS|SUCCESS|FAILED|TIMED_OUT
     started_at           TIMESTAMP,
@@ -125,3 +125,18 @@ CREATE INDEX IF NOT EXISTS idx_job_execution_flow_execution_id
     ON demo_galaxy_jobs.job_execution (flow_execution_id);
 CREATE INDEX IF NOT EXISTS idx_job_execution_status
     ON demo_galaxy_jobs.job_execution (status);
+
+-- --- execution_lock: "is this job already running?" guard for SKIP/QUEUE policies. ---
+-- A row exists while a (tenant, service, job) is in flight. Insert with
+-- ON CONFLICT (tenant_name, service_context, job_name) DO NOTHING to make the
+-- "acquire" race-safe across pods; the row is deleted on job completion.
+CREATE TABLE IF NOT EXISTS demo_galaxy_jobs.execution_lock (
+    id                 UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_name        VARCHAR(64)  NOT NULL,
+    service_context    VARCHAR(128) NOT NULL,
+    job_name           VARCHAR(128) NOT NULL,
+    flow_execution_id  UUID         NOT NULL REFERENCES demo_galaxy_jobs.flow_execution(id),
+    job_execution_id   UUID         NOT NULL REFERENCES demo_galaxy_jobs.job_execution(id),
+    locked_at          TIMESTAMP  NOT NULL DEFAULT now(),
+    UNIQUE (tenant_name, service_context, job_name)
+);

@@ -54,6 +54,7 @@ pub async fn save_registration(config: &Config) -> Result<u64, sqlx::Error> {
         // 2. job_definition — the reusable unit of work. The transport-only
         //    contract fields live in parameters; retry policy is its own column.
         let parameters = json!({
+            "serviceBaseUrl": job_cfg.service_base_url,
             "callbackBean": job.callback_bean,
             "callbackEndpoint": job.callback_endpoint,
             "eventTopic": job.event_topic,
@@ -70,20 +71,20 @@ pub async fn save_registration(config: &Config) -> Result<u64, sqlx::Error> {
         sqlx::query(
             r#"
             INSERT INTO demo_galaxy_jobs.job_definition
-                (project_id, name, job_type, target_service, parameters, retry_policy)
+                (project_id, name, job_type, service_context, parameters, retry_policy)
             VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (project_id, name) DO UPDATE SET
-                job_type       = EXCLUDED.job_type,
-                target_service = EXCLUDED.target_service,
-                parameters     = EXCLUDED.parameters,
-                retry_policy   = EXCLUDED.retry_policy,
-                updated_at     = now()
+                job_type        = EXCLUDED.job_type,
+                service_context = EXCLUDED.service_context,
+                parameters      = EXCLUDED.parameters,
+                retry_policy    = EXCLUDED.retry_policy,
+                updated_at      = now()
             "#,
         )
         .bind(project_id)
         .bind(job.name.as_str())
         .bind(job.trigger_type.as_str())
-        .bind(job_cfg.service_base_url.as_str())
+        .bind(job_cfg.service.as_str())
         .bind(&parameters)
         .bind(&retry_policy)
         .execute(&mut *tx)
@@ -96,7 +97,7 @@ pub async fn save_registration(config: &Config) -> Result<u64, sqlx::Error> {
             "slaSeconds": job.sla_seconds,
             "timeoutSeconds": job.timeout_seconds,
         });
-        let flow_definition_id: Uuid = sqlx::query_scalar(
+        sqlx::query(
             r#"
             INSERT INTO demo_galaxy_jobs.flow_definition
                 (name, version, flow, sla_policy, created_by)
@@ -105,19 +106,19 @@ pub async fn save_registration(config: &Config) -> Result<u64, sqlx::Error> {
                 flow       = EXCLUDED.flow,
                 sla_policy = EXCLUDED.sla_policy,
                 updated_at = now()
-            RETURNING id
             "#,
         )
         .bind(job.name.as_str())
         .bind(&flow)
         .bind(&sla_policy)
         .bind(job_cfg.service.as_str())
-        .fetch_one(&mut *tx)
+        .execute(&mut *tx)
         .await?;
 
-        // 4. scheduled_trigger — only for jobs with a cron. next_fire_time is the
-        //    next cron occurrence; manual jobs get no trigger so never auto-fire.
-        upsert_trigger(&mut tx, &tenant, flow_definition_id, job).await?;
+        // 4. scheduled_trigger — only for jobs with a cron. The trigger lives in the
+        //    finzly master DB, so it references the flow by name (= job.name here).
+        //    Manual jobs get no trigger so they never auto-fire.
+        upsert_trigger(&mut tx, &tenant, job.name.as_str(), job).await?;
     }
 
     tx.commit().await?;
@@ -128,7 +129,7 @@ pub async fn save_registration(config: &Config) -> Result<u64, sqlx::Error> {
 async fn upsert_trigger(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant: &str,
-    flow_definition_id: Uuid,
+    flow_definition_name: &str,
     job: &Job,
 ) -> Result<(), sqlx::Error> {
     let Some(cron) = job.cron.as_deref() else {
@@ -141,16 +142,16 @@ async fn upsert_trigger(
     sqlx::query(
         r#"
         INSERT INTO demo_galaxy_jobs.scheduled_trigger
-            (tenant_name, flow_definition_id, cron_expression, next_fire_time, created_by)
+            (tenant_name, flow_definition_name, cron_expression, next_fire_time, created_by)
         VALUES ($1, $2, $3, $4, $5)
-        ON CONFLICT (tenant_name, flow_definition_id) DO UPDATE SET
+        ON CONFLICT (tenant_name, flow_definition_name) DO UPDATE SET
             cron_expression = EXCLUDED.cron_expression,
             next_fire_time  = EXCLUDED.next_fire_time,
             updated_at      = now()
         "#,
     )
     .bind(tenant)
-    .bind(flow_definition_id)
+    .bind(flow_definition_name)
     .bind(cron)
     .bind(next_fire_time)
     .bind(job.name.as_str())

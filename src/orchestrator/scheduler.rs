@@ -84,23 +84,30 @@ impl Scheduler {
 
         let mut tx = pool.begin().await?;
 
+        // The trigger references the flow by name (master-DB table); resolve it to
+        // the enabled flow's latest version to get the id/version/flow DAG.
         let triggers: Vec<ClaimedTrigger> = sqlx::query_as::<_, ClaimedTrigger>(
             r#"
             SELECT
-                st.id                 AS trigger_id,
-                st.tenant_name        AS tenant_name,
-                st.flow_definition_id AS flow_definition_id,
-                st.cron_expression    AS cron_expression,
-                st.next_fire_time     AS scheduled_fire_time,
-                fd.name               AS flow_name,
-                fd.version            AS flow_version,
-                fd.flow               AS flow
+                st.id              AS trigger_id,
+                st.tenant_name     AS tenant_name,
+                fd.id              AS flow_definition_id,
+                st.cron_expression AS cron_expression,
+                st.next_fire_time  AS scheduled_fire_time,
+                fd.name            AS flow_name,
+                fd.version         AS flow_version,
+                fd.flow            AS flow
             FROM demo_galaxy_jobs.scheduled_trigger st
             JOIN demo_galaxy_jobs.flow_definition fd
-              ON fd.id = st.flow_definition_id
+              ON fd.name = st.flow_definition_name
+             AND fd.is_enabled = true
+             AND fd.version = (
+                 SELECT max(f2.version)
+                 FROM demo_galaxy_jobs.flow_definition f2
+                 WHERE f2.name = st.flow_definition_name AND f2.is_enabled = true
+             )
             WHERE st.next_fire_time IS NOT NULL
               AND st.next_fire_time <= now()
-              AND fd.is_enabled = true
             ORDER BY st.next_fire_time
             FOR UPDATE OF st SKIP LOCKED
             LIMIT $1
