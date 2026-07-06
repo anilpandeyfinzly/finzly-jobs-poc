@@ -1,12 +1,9 @@
-//! Kafka transport: a process-wide publisher plus the topic names used by the
-//! orchestration pipeline. Mirrors how the Phoenix services use phoenix-kafka-sdk
-//! (`Publisher::send_message` / `Consumer`), so this POC can later run against the
-//! same brokers with no code change.
+//! Kafka transport: a process-wide publisher plus the Scheduler's one topic.
+//! Mirrors how the Phoenix services use phoenix-kafka-sdk (`Publisher::send_message`),
+//! so this POC can later run against the same brokers with no code change.
 //!
-//! Three topics carry the pipeline (see docs/DESIGN):
-//!   - flow.execution.requested  : scheduler -> orchestrator (a due flow should run)
-//!   - job.execution.requested   : orchestrator -> worker    (dispatch one job)
-//!   - job.execution.completed   : worker -> orchestrator     (job finished)
+//! The Scheduler publishes a single event when a trigger is due:
+//!   - finzly.jobs.trigger.due : scheduler -> orchestrator (a due trigger fired)
 
 use std::sync::OnceLock;
 
@@ -19,24 +16,10 @@ use phoenix_security_sdk::TenantContext;
 
 static PUBLISHER: OnceLock<Publisher> = OnceLock::new();
 
-/// Topic a due flow-run request is published to (scheduler -> orchestrator).
-pub fn topic_flow_requested() -> String {
-    get_config_property("finzly.jobs.flow.execution.requested.topic")
-        .unwrap_or_else(|| "finzly.jobs.flow.execution.requested".to_string())
-}
-
-/// Topic a single job dispatch is published to (orchestrator -> worker).
-#[allow(dead_code)] // consumed in stage 3 (per-job dispatch)
-pub fn topic_job_requested() -> String {
-    get_config_property("finzly.jobs.job.execution.requested.topic")
-        .unwrap_or_else(|| "finzly.jobs.job.execution.requested".to_string())
-}
-
-/// Topic a job-completion is published to (worker -> orchestrator).
-#[allow(dead_code)] // consumed in stage 3 (per-job dispatch)
-pub fn topic_job_completed() -> String {
-    get_config_property("finzly.jobs.job.execution.completed.topic")
-        .unwrap_or_else(|| "finzly.jobs.job.execution.completed".to_string())
+/// Topic the "trigger due" event is published to (scheduler -> orchestrator).
+pub fn topic_due() -> String {
+    get_config_property("finzly.jobs.due.topic")
+        .unwrap_or_else(|| "finzly.jobs.trigger.due".to_string())
 }
 
 /// Build the process-wide publisher. Call once at startup after config is loaded.
@@ -51,8 +34,7 @@ pub fn init_publisher() -> Result<(), String> {
 }
 
 /// Publish `msg` to `topic` keyed by `key`. When `ordered` is true the SDK routes
-/// by `hash(key) % partitions`, giving FIFO ordering per key (used for the QUEUE
-/// concurrency policy, where key = job name).
+/// by `hash(key) % partitions` (FIFO per key); the due event uses `false`.
 pub async fn publish<T: Serialize>(
     topic: &str,
     key: &str,

@@ -6,7 +6,7 @@
 
 mod kafka;
 mod registration;
-mod orchestrator;
+mod scheduler;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -64,9 +64,9 @@ async fn async_main() -> Result<(), String> {
     kafka::init_publisher()?;
     info!("Kafka publisher initialized successfully");
 
-    // 6. Start the background job orchestrator (scheduler publishes due flows over
-    //    Kafka; the orchestrator consumer receives them and runs the executor).
-    orchestrator::init_orchestrator();
+    // 6. Start the scheduler: the claim loop polls due triggers and stages a
+    //    "trigger due" event in the outbox; the outbox publisher sends it to Kafka.
+    scheduler::init_scheduler();
 
     // 7. Axum server — feature routers are merged in here.
     let app = Router::new()
