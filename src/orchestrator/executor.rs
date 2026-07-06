@@ -50,7 +50,7 @@ impl Executor {
             INSERT INTO demo_galaxy_jobs.flow_execution
                 (flow_definition_id, flow_version, idempotency_key, status, started_at)
             VALUES ($1, $2, $3, 'RUNNING', now())
-            ON CONFLICT (idempotency_key) DO NOTHING
+            ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
             RETURNING id
             "#,
         )
