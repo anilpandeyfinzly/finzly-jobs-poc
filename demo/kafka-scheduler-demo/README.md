@@ -44,7 +44,7 @@ You should see `Subscribed; waiting for messages`.
 | `HTTP_ADDR` | `0.0.0.0:8090` | HTTP bind address |
 | `KAFKA_BROKERS` | `localhost:9092` | Broker list |
 | `KAFKA_SECURITY_PROTOCOL` | `PLAINTEXT` | Must match the local broker |
-| `KAFKA_TOPIC` | `finzly.jobs.flow.execution.requested` | Topic the service publishes fires to |
+| `KAFKA_TOPIC` | `finzly.jobs.trigger.due` | Topic the service publishes fires to |
 | `KAFKA_GROUP_ID` | `kafka-scheduler-demo` | Consumer group |
 | `KAFKA_AUTO_OFFSET_RESET` | `latest` | `earliest` to replay the whole topic |
 | `RUST_LOG` | `info` | Log level |
@@ -70,12 +70,12 @@ Example `/observations` entry:
 {
   "count": 1,
   "observations": [{
-    "topic": "finzly.jobs.flow.execution.requested",
+    "topic": "finzly.jobs.trigger.due",
     "key": "de02cadc-56a1-4220-abb8-b27063e09003",
     "scheduled_at": "2026-07-06T04:51:06.788593+00:00",
     "received_at": "2026-07-06T04:51:07.031000+00:00",
     "delay_ms": 242,
-    "payload": { "flowDefinitionId": "…", "tenantName": "finzly", "scheduleFireTime": "…" }
+    "payload": { "triggerId": "…", "tenantName": "finzly", "targetRef": "daily-settlement", "scheduleFireTime": "…" }
   }]
 }
 ```
@@ -91,9 +91,12 @@ in a `MessageWrapper` (camelCase) with the real object under `object`:
   "eventType": null,
   "traceDetails": "00-…-…-01",
   "object": {
-    "flowDefinitionId": "…",
+    "triggerId": "…",
     "tenantName": "finzly",
-    "scheduleFireTime": "2026-07-06T04:51:06.788593"
+    "targetType": "FLOW",
+    "targetRef": "daily-settlement",
+    "scheduleFireTime": "2026-07-06T04:51:06.788593",
+    "idempotencyKey": "…"
   },
   "messageId": "…"
 }

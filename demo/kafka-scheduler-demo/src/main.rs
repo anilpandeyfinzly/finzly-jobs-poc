@@ -42,7 +42,7 @@ impl Config {
         Self {
             http_addr: get("HTTP_ADDR", "0.0.0.0:8090"),
             brokers: get("KAFKA_BROKERS", "localhost:9092"),
-            topic: get("KAFKA_TOPIC", "finzly.jobs.flow.execution.requested"),
+            topic: get("KAFKA_TOPIC", "finzly.jobs.trigger.due"),
             group_id: get("KAFKA_GROUP_ID", "kafka-scheduler-demo"),
             security_protocol: get("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT"),
             offset_reset: get("KAFKA_AUTO_OFFSET_RESET", "latest"),
