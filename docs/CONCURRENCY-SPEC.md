@@ -1,5 +1,10 @@
 # Concurrency Control — Exhaustive Spec (SKIP / QUEUE / PARALLEL)
 
+> **Scope: Orchestrator (future — out of current POC scope).** This POC implements
+> only the **Scheduler Service** (cron triggers → `finzly.jobs.trigger.due`).
+> Concurrency policy, dispatch, and execution belong to the separate **Orchestrator**
+> service. This spec is kept as the downstream contract the Scheduler fires into.
+
 Every detail of how the orchestrator decides and enforces per-job concurrency when a
 job of a flow is dispatched. Refines LOW-LEVEL-DESIGN §F3a / §F5.
 

@@ -1,5 +1,11 @@
 # finzly-jobs — Low-Level Design
 
+> **Scope note.** This document covers the whole system. The **current POC implements
+> only the Scheduler Service** — §F1–F2 (create/schedule + claim) and the due event.
+> Everything from **§F3 dispatch onward (§F3a–F10, §11) and the concurrency spec is the
+> separate Orchestrator service — out of the current POC's scope**, kept here as the
+> downstream contract. The Scheduler's output is `finzly.jobs.trigger.due`.
+
 End-to-end design of the cron-driven, Kafka-orchestrated job scheduler: crate
 boundaries, data model, message contracts, state machines, and every runtime flow
 with its failure/edge cases. Companion to the architecture diagram and

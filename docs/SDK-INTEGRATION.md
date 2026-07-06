@@ -1,5 +1,10 @@
 # finzly-jobs-sdk — Integration Guide
 
+> **Scope: Orchestrator (future — out of current POC scope).** The Client SDK and the
+> Worker/Host-Service model are part of the **Orchestrator** side. The current POC is
+> only the **Scheduler Service** (cron triggers → `finzly.jobs.trigger.due`) and does
+> not ship this SDK yet. Kept as the target contract.
+
 How any service becomes a **job worker** by importing `finzly-jobs-sdk`. You write
 `Job` implementations and register them; the SDK does all the plumbing — consuming
 the dispatch topic, idempotency, heartbeat, running your job, and reporting the

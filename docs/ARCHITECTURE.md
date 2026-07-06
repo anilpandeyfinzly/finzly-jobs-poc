@@ -3,6 +3,11 @@
 Renders on GitHub and any Mermaid-aware viewer. Companion to
 [LOW-LEVEL-DESIGN.md](LOW-LEVEL-DESIGN.md) and [SDK-INTEGRATION.md](SDK-INTEGRATION.md).
 
+> **What this POC builds:** only the **Scheduler** box below (cron claim → outbox →
+> `finzly.jobs.trigger.due`). The **Orchestrator**, **Worker/Host Service**, and **Client
+> SDK** are separate, future services — shown here for the full picture, not implemented
+> in this repo.
+
 ## 1. System overview
 
 ```mermaid

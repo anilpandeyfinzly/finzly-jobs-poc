@@ -4,9 +4,13 @@ Proof of concept for the new **finzly-job-service**: a multi-tenant, cron-driven
 Kafka-orchestrated job/flow scheduler. This document is the reference for the data
 model, the message topics, and the end-to-end flows.
 
-> Status: POC. Job execution is **log-only** (the worker reports SUCCESS without
-> doing real work). Crash-detection (Redis heartbeat) and the resume endpoint are
-> designed here but **not yet implemented** — see [Roadmap](#roadmap).
+> **Scope update (2026):** the system was split into a **Scheduler** (WHEN), a separate
+> **Orchestrator** (assignment/flow/execution), and **Worker = Host Service + Client
+> SDK**. **This POC now implements only the Scheduler Service** — cron `scheduled_trigger`
+> rows → a `finzly.jobs.trigger.due` Kafka event (via a transactional outbox). Flow/job
+> definitions, dispatch, concurrency, execution tracking, workers, and the SDK described
+> below are the **Orchestrator** (separate service, not in this POC). See
+> [ARCHITECTURE.md](ARCHITECTURE.md) and [LOW-LEVEL-DESIGN.md](LOW-LEVEL-DESIGN.md).
 
 ---
 
