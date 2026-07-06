@@ -13,11 +13,16 @@ runtime you register handlers into, then start).
 | Style | Dispatch | Who runs the job | How completion is reported |
 |---|---|---|---|
 | **A. Embedded worker** (EVENT) | Kafka `job-dispatch-<ctx>` | the SDK, in your process (`Job::execute`) | SDK reports **automatically** |
-| **B. Fire-and-callback** (API) | orchestrator HTTP-`POST`s your endpoint; you **202-ack** and work async | your own code / another system | **you** call `JobReporter` when done — over **Kafka or HTTP**, your choice |
+| **B. Fire-and-callback** (API) | the **worker** HTTP-`POST`s your endpoint; you **202-ack** and work async | your own code / another system | **you** call `JobReporter` when done — over **Kafka or HTTP**, your choice |
 
 Style A is turnkey (write a `Job`, register it). Style B is for work that outlives the
 request — you ack immediately, then push a terminal result back later via the
 `JobReporter` helper (§4.5). Both use the same SDK; a service can use both.
+
+> **Where the report goes:** the result is reported **back to the worker that fired the
+> job** — not straight to the orchestrator. The worker made the call, so only it knows the
+> fire→response time and can judge SLA/timeout; it then forwards the verdict upstream. You
+> don't configure that target — it arrives in the `JobHandle` (`report_to`) with the fire.
 
 ---
 
@@ -77,9 +82,8 @@ spring.kafka.properties.security-protocol=PLAINTEXT     # PLAINTEXT locally; SSL
 bankos.redis.cache.common.member.ip=localhost
 bankos.redis.cache.common.member.port=6379
 
-# Reporting transport (Style B) — how you push results back to the orchestrator
-finzly.jobs.report.transport=kafka                 # or: http
-finzly.jobs.orchestrator.base-url=https://finzly-jobs.internal   # required when transport=http
+# Reporting transport (Style B) — how you push results back to the WORKER
+finzly.jobs.report.transport=kafka                 # or: http (worker address comes in JobHandle.report_to)
 
 # Postgres per-tenant (only if your jobs query the DB)
 bankos.tenants=banka,bankb
@@ -152,12 +156,12 @@ A panic or an `Err` bubbling out is treated as `failure` — but prefer returnin
 
 When your service does the work asynchronously (you got a fire + acked, or you run the
 job on your own schedule), report the outcome with the `JobReporter` helper. **You pick
-the transport** — Kafka or an HTTP callback to the job-service — with one config key;
-the SDK has both wired.
+the transport** — Kafka or an HTTP callback — with one config key; the SDK has both
+wired. The report is addressed **to the worker** (from `JobHandle.report_to`), which owns
+the SLA verdict and forwards it to the orchestrator.
 
 ```properties
-finzly.jobs.report.transport=kafka          # or: http
-finzly.jobs.orchestrator.base-url=https://finzly-jobs.internal   # required for http
+finzly.jobs.report.transport=kafka          # or: http  (the worker's address comes from the fire)
 ```
 
 ```rust
@@ -299,9 +303,10 @@ impl JobRuntime {
     pub async fn start(self) -> Result<()>;                     // runs the consumer loop
 }
 
-pub struct JobHandle {                            // correlation id, delivered at dispatch
+pub struct JobHandle {                            // correlation + report target, delivered at fire
     pub job_execution_id: Uuid, pub flow_execution_id: Uuid,
     pub tenant: String, pub service_context: String, pub job_name: String,
+    pub report_to: ReportTarget,                  // the worker's topic (kafka) or URL (http)
 }
 pub struct JobReporter { /* ... */ }             // Style B: report async results back
 impl JobReporter {

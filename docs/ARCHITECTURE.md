@@ -13,13 +13,14 @@ flowchart TB
     SCH["Scheduler<br/>cron claim + outbox"]
     DIS["Dispatcher<br/>DAG walk + concurrency"]
     COMP["Completion handler"]
-    SWP["Sweeps<br/>retry · SLA/timeout · crash"]
+    SWP["Sweeps<br/>retry · SLA backstop · crash"]
   end
 
   %% ---------------- Kafka ----------------
   subgraph KAFKA["Kafka topics"]
     T1["flow.execution.requested"]
-    T2["job-dispatch-[service_context]"]
+    T2["job-dispatch-[ctx]"]
+    T4["job-report-[ctx]"]
     T3["job.execution.completed"]
   end
 
@@ -29,17 +30,21 @@ flowchart TB
     DEF[("project · job_definition<br/>flow_definition")]
     EXE[("flow_execution · job_execution<br/>execution_lock")]
   end
-  RED[("Redis<br/>heartbeat-[jobExecId]")]
+  RED[("Redis<br/>worker heartbeat")]
 
-  %% ---------------- Worker side ----------------
-  subgraph WRK["finzly-jobs-worker / any business service"]
-    SDK["finzly-jobs-sdk<br/>JobRuntime · JobReporter · heartbeat"]
-    JOB["Job impls"]
+  %% ---------------- Worker ----------------
+  subgraph WRK["finzly-jobs-worker (fires + owns SLA)"]
+    WSDK["SDK worker runtime<br/>fire (TLS) · SLA timer · report-up"]
+  end
+
+  %% ---------------- Business service ----------------
+  subgraph SVC["business service"]
+    SSDK["finzly-jobs-sdk<br/>JobReporter"]
+    JOB["Job / business logic"]
   end
 
   %% definitions & control
   API -->|CRUD / resume| DEF
-  API -.->|"POST /jobs/.../status,progress"| COMP
 
   %% schedule -> fire
   SCH -->|"claim FOR UPDATE SKIP LOCKED"| MST
@@ -48,25 +53,30 @@ flowchart TB
   DIS -->|open flow_execution idempotent| EXE
   DIS -->|read enabled version| DEF
 
-  %% dispatch: two modes
-  DIS -->|"③ EVENT: publish"| T2
-  T2  -->|consume| SDK
-  DIS -->|"③ API: HTTP fire → 202 ack"| SDK
+  %% assign to worker
+  DIS -->|"③ assign (concurrency policy)"| T2
+  T2  -->|consume| WSDK
 
-  %% execute
-  SDK -->|run| JOB
-  SDK -->|beat TTL 120s| RED
+  %% worker fires the service
+  WSDK -->|"④ fire (HTTPS/TLS) → 202 ack"| SSDK
+  WSDK -->|record fired_at · deadline| EXE
+  WSDK -->|heartbeat while awaiting| RED
+  SSDK --> JOB
 
-  %% report back: two transports
-  SDK -->|"④ report (kafka)"| T3
-  SDK -.->|"④ report (http) POST /status"| COMP
-  T3  -->|consume| COMP
+  %% service reports BACK TO THE WORKER
+  SSDK -->|"⑤ report (kafka)"| T4
+  SSDK -.->|"⑤ report (http)"| WSDK
+  T4   -->|consume| WSDK
+
+  %% worker computes SLA verdict, reports up
+  WSDK -->|"⑥ verdict + slaBreached"| T3
+  T3   -->|consume| COMP
 
   %% completion & recovery
-  COMP -->|"⑤ update · release lock · close/advance"| EXE
-  SWP  -->|check liveness| RED
-  SWP  -->|"⑥ timeout / retry / fail"| EXE
-  SWP  -->|"re-dispatch"| T2
+  COMP -->|"⑦ update · release lock · close/advance"| EXE
+  SWP  -->|worker-death backstop| RED
+  SWP  -->|"timeout / retry / fail"| EXE
+  SWP  -->|"re-assign"| T2
 ```
 
 ## 2. One fire, end to end (EVENT vs API, with report-back)
@@ -78,8 +88,8 @@ sequenceDiagram
     participant DB as Postgres
     participant K as Kafka
     participant DIS as Dispatcher
-    participant W as Worker SDK
-    participant J as Job / business svc
+    participant W as Worker
+    participant S as Business service (SDK)
     participant R as Redis
     participant CMP as Completion
 
@@ -88,27 +98,35 @@ sequenceDiagram
     K->>DIS: consume
     DIS->>DB: open flow_execution (ON CONFLICT DO NOTHING)
     Note over DIS,DB: duplicate fire → no row → stop
+    DIS->>K: job-dispatch-[ctx] (assign; SKIP takes execution_lock)
+    K->>W: consume assignment
+    W->>DB: record fired_at + deadline (RUNNING)
+    W->>R: heartbeat while awaiting
 
-    alt EVENT job (Kafka dispatch)
-        DIS->>K: job-dispatch-[ctx]  (SKIP takes execution_lock)
-        K->>W: consume JobExecutionRequested
-        W->>R: heartbeat (TTL 120s, refresh 60s)
-        W->>J: Job::execute(ctx)
-        J-->>W: Success / Failure
-        W->>K: job.execution.completed   (report transport = kafka)
-    else API job (HTTP fire)
-        DIS->>J: POST callbackEndpoint (JobExecutionRequested + handle)
-        J-->>DIS: 202 Accepted  (ack ≠ complete → RUNNING)
-        Note over J: async work, may outlive request
-        J->>CMP: POST /api/jobs/executions/{id}/status  (report transport = http)
+    alt API job (HTTP fire)
+        W->>S: POST callbackEndpoint (HTTPS/TLS verified) + JobHandle
+        S-->>W: 202 Accepted  (ack ≠ complete)
+    else EVENT job
+        W->>K: publish to service eventTopic
+        K->>S: consume
     end
 
-    K->>CMP: job.execution.completed (kafka path)
+    Note over S: async work, may outlive the fire
+    alt service reports (transport = kafka)
+        S->>K: job-report-[ctx]
+        K->>W: consume report
+    else transport = http
+        S->>W: POST worker /report/{jobExecutionId}
+    end
+
+    W->>W: elapsed vs slaSeconds → slaBreached; or SLA timer fired → TIMED_OUT
+    W->>K: job.execution.completed (+ slaBreached, elapsedMs)
+    K->>CMP: consume
     CMP->>DB: update job · release lock · retry or close flow (FOR UPDATE)
 
-    opt worker crashed / stopped reporting
-        Note over R,CMP: heartbeat lapses or last_report_at stale
-        CMP-->>DB: sweep → FAILED(WORKER_LOST) / TIMED_OUT → retry
+    opt worker itself dies
+        Note over R,CMP: worker heartbeat lapses
+        CMP-->>DB: orchestrator sweep → FAILED(WORKER_LOST) → retry
     end
 ```
 
@@ -132,5 +150,7 @@ stateDiagram-v2
     SKIPPED --> [*]
 ```
 
-Legend: ① fire · ② dispatch decision · ③ dispatch (EVENT/API) · ④ report (kafka/http)
-· ⑤ complete · ⑥ recover. Solid = Kafka/DB, dotted = HTTP.
+Legend: ① scheduler fire · ② dispatch · ③ assign to worker · ④ worker fires service
+(TLS) · ⑤ service reports **back to worker** (kafka/http) · ⑥ worker verdict + SLA · ⑦
+orchestrator completes. Solid = Kafka/DB, dotted = HTTP. **The worker owns the SLA
+verdict because it made the fire.**

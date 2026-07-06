@@ -123,15 +123,15 @@ body under `object`). Bodies below are the `object`.
 |---|---|---|
 | `finzly.jobs.flow.execution.requested` | `flowDefinitionId` | orchestrator(scheduler) → orchestrator(dispatcher) |
 | `job-dispatch-<service_context>` | `jobName` (QUEUE ⇒ FIFO per key) | orchestrator(dispatcher) → worker SDK |
-| `finzly.jobs.job.execution.completed` | `jobName` | worker SDK → orchestrator(completion) — **Kafka report transport** |
+| `job-report-<service_context>` | `jobExecutionId` | business service → **worker** — Kafka report transport (§11.3) |
+| `finzly.jobs.job.execution.completed` | `jobName` | **worker → orchestrator** — final verdict + `slaBreached` (§11.4) |
 | `<topic>.DLT` | — | dead-letter after N failed handles |
 
 **HTTP transports (§11):**
 | Endpoint | Direction |
 |---|---|
-| `POST <callbackEndpoint>` (on the business service) | orchestrator → service — **API dispatch (fire)**, returns `202 Accepted` |
-| `POST /api/jobs/executions/{jobExecutionId}/status` (on orchestrator) | service → orchestrator — **HTTP report transport** (terminal) |
-| `POST /api/jobs/executions/{jobExecutionId}/progress` (on orchestrator) | service → orchestrator — status report / liveness |
+| `POST <callbackEndpoint>` (on the business service) | **worker → service** — API fire (TLS-verified), returns `202 Accepted` |
+| `POST <worker>/report/{jobExecutionId}` (on the worker) | **service → worker** — HTTP report transport (terminal + progress) |
 
 ### 3.1 FlowExecutionRequested
 ```json
@@ -335,71 +335,86 @@ bankos.redis.cache.common.member.{ip,port}
 
 ---
 
-## 11. Dispatch & reporting transports (API vs EVENT)
+## 11. Dispatch & the worker-mediated report path
 
-A job is *dispatched* one way and its result is *reported* back another way. These are
-independent choices; the SDK abstracts both. This refines F3a / F4 / F5.
+**Key principle:** the **worker fires the job, so the worker owns the SLA verdict.** The
+business service reports its result **back to the worker** (not the orchestrator) —
+because only the worker knows the fire→response elapsed time for that attempt. The worker
+then reports the *final* outcome (with the SLA/timeout verdict) up to the orchestrator.
 
-### 11.1 Dispatch modes (`job_definition.job_type`)
-- **EVENT (Kafka)** — orchestrator publishes `JobExecutionRequested` to
-  `job-dispatch-<service_context>`. The embedded SDK `JobRuntime` consumes and runs the
-  `Job` in-process. Best for jobs that finish within the worker.
-- **API (HTTP fire)** — orchestrator's HTTP client `POST`s the dispatch to the service's
-  `callbackEndpoint`. The service **acks** with `202 Accepted` and processes
-  asynchronously (possibly across restarts / other systems). **Ack ≠ complete.**
+```
+orchestrator ──job-dispatch-<ctx>──▶ worker ──fire (HTTP/TLS or event)──▶ service
+                                       ▲                                      │
+                                       └──────── job-report-<ctx> ────────────┘   (SDK)
+worker ──job.execution.completed (+ sla_breached, durations)──▶ orchestrator
+```
 
-Dispatch outcome semantics (API mode):
+### 11.1 Assignment: orchestrator → worker
+Orchestrator publishes `JobExecutionRequested` to `job-dispatch-<service_context>` (§F3a,
+concurrency policy applied). The **worker** consumes it — the worker is "handled by" the
+orchestrator (assigned work), and is the component that actually invokes the service.
+
+### 11.2 Fire: worker → service (SSL-safe)
+The worker invokes the business service and **must not let TLS be downgraded/bypassed** —
+verify the cert chain, no `danger_accept_invalid_certs`, honor the configured CA. Modes:
+- **API (HTTP)** — worker `POST`s the fire to the service `callbackEndpoint` over HTTPS;
+  service returns **`202 Accepted`** (ack, *not* completion). Worker records `fired_at`,
+  sets `deadline = fired_at + timeoutSeconds`, starts the SLA timer.
+- **EVENT (Kafka)** — worker publishes to the service's `eventTopic`; same SLA timer starts.
+
 | Fire result | Meaning | Action |
 |---|---|---|
-| `2xx` (ideally 202) | Accepted | job → `RUNNING`, set `deadline`, `last_report_at = now()` |
-| non-2xx / timeout / conn refused | Not accepted | dispatch failed → retry dispatch (bounded); not a job failure |
+| `2xx` (ideally 202) | Accepted | job `RUNNING`; SLA timer armed |
+| non-2xx / TLS error / timeout | Not accepted | dispatch failure → retry the fire (bounded); not a job failure |
 
-### 11.2 Reporting result back — the `JobReporter` helper
-The doing-service reports the terminal status (and optional progress) via one SDK call.
-Transport is the **consuming service's choice** (`finzly.jobs.report.transport = kafka | http`):
+### 11.3 Report back: service → worker (`JobReporter`)
+The service reports the terminal result (and optional progress) **to the worker** via one
+SDK call. Transport is the service's choice (`finzly.jobs.report.transport = kafka | http`):
+- **kafka** → publish to **`job-report-<service_context>`** (consumed by the worker pool).
+- **http** → `POST` the worker's report ingress (worker base URL from the fire payload).
 
-- **kafka** → publishes `JobExecutionCompleted` on `finzly.jobs.job.execution.completed`
-  (reuses the already-established `Publisher`).
-- **http** → `POST /api/jobs/executions/{jobExecutionId}/status` on the orchestrator.
+Either way the message is correlated by `job_execution_id`; any worker in the pool can
+handle it because the fire record (`fired_at`, `deadline`) is in shared Postgres — so the
+"worker layer" owns SLA without pinning to one stateful pod.
 
 ```rust
-// handed to the service in the dispatch payload; echoed back for correlation
-pub struct JobHandle {
+pub struct JobHandle {                 // delivered to the service in the fire; echoed back
     pub job_execution_id: Uuid, pub flow_execution_id: Uuid,
     pub tenant: String, pub service_context: String, pub job_name: String,
+    pub report_to: ReportTarget,       // worker topic (kafka) or worker URL (http)
 }
-impl JobReporter {
-    pub fn from_config() -> Result<Self>;                 // picks kafka|http + target
-    pub async fn running(&self,  h: &JobHandle) -> Result<()>;
-    pub async fn progress(&self, h: &JobHandle, note: &str) -> Result<()>;  // FIXED_TIME/COMPOSITIONAL
+impl JobReporter {                     // SDK helper on the SERVICE side
+    pub fn from_config() -> Result<Self>;
+    pub async fn progress(&self, h: &JobHandle, note: &str) -> Result<()>;
     pub async fn success(&self,  h: &JobHandle, output: impl Into<String>) -> Result<()>;
     pub async fn failure(&self,  h: &JobHandle, reason: impl Into<String>) -> Result<()>;
 }
 ```
-For the **embedded (EVENT) worker** the SDK calls `JobReporter` for you automatically
-after `Job::execute`. For **API/async** services you call it yourself when the work
-finishes.
 
-### 11.3 Orchestrator dual completion ingress
-Both paths converge on the **same** completion handler (F5), both idempotent:
-- **Kafka** consumer on `finzly.jobs.job.execution.completed`.
-- **HTTP** `POST /api/jobs/executions/{id}/status` (terminal) and `/progress` (liveness).
+### 11.4 Verdict & forward: worker → orchestrator
+On receiving the service's report (or when its SLA timer fires first), the worker:
+1. computes `elapsed = now - fired_at`; sets `sla_breached = elapsed > slaSeconds`;
+2. if the timer fired with no report → verdict `TIMED_OUT` (and ignores any late report);
+3. publishes `JobExecutionCompleted` (§3.3, **+ `slaBreached`, `elapsedMs`**) to the
+   orchestrator, which runs completion (F5).
 
-`/status` and the Kafka message carry the same `JobExecutionCompleted` body (§3.3).
+The orchestrator keeps only a **coarse backstop**: if the *worker itself* dies (heartbeat
+lapses, §F8) the orchestrator sweep fails the job. Fine-grained SLA lives in the worker.
 
-### 11.4 Liveness, unified
-`job_execution.last_report_at` is bumped by **either** the embedded heartbeat (Redis, §F8)
-**or** an HTTP `/progress` push. The SLA sweep (§F7) times out a `RUNNING` job whose
-`last_report_at` is older than `timeoutSeconds` — so API jobs that stop reporting are
-caught the same way as crashed embedded workers. `status_report_mode` (FIXED_TIME /
-COMPOSITIONAL) only sets the *expected* cadence for alerting; the timeout is the backstop.
+### 11.5 Liveness
+`job_execution.last_report_at` is bumped by the worker on each service progress push (or
+the worker's own heartbeat while awaiting). Two levels:
+- **worker-local SLA timer** — precise, per fire (primary).
+- **orchestrator sweep** on `deadline`/heartbeat — backstop for a dead worker.
 
-### 11.5 Case matrix (transport-specific)
+### 11.6 Case matrix (transport-specific)
 | Case | Handling |
 |---|---|
-| API fire returns 202, then service never reports | SLA timeout via `last_report_at` (11.4) |
-| API fire returns 5xx / times out | dispatch retry (11.1), job not marked failed |
-| Service reports via HTTP but orchestrator is down | service retries the `POST` (its `JobReporter` retries / buffers) |
-| Duplicate report (Kafka + HTTP, or retried POST) | idempotent completion update (F5.1) |
-| Report arrives after SLA timeout already fired | ignored by terminal-status guard |
-| Service chooses kafka but broker down | `JobReporter` buffers/retries; last_report_at stale → eventual timeout |
+| Fire: TLS handshake fails / cert invalid | fire rejected → dispatch retry; never silently downgraded (11.2) |
+| API fire 202, service never reports | worker SLA timer → TIMED_OUT → report up (11.4) |
+| API fire 5xx / timeout | worker retries the fire (bounded), not a job failure |
+| Service reports to worker but worker pod restarted | another worker consumes `job-report-<ctx>`, correlates via shared fire record (11.3) |
+| Duplicate report (retry, or kafka+http) | idempotent completion update (F5.1) |
+| Report arrives after worker already timed out | ignored by terminal-status guard |
+| Worker itself dies mid-wait | orchestrator heartbeat sweep → FAILED(WORKER_LOST) (F8) |
+| Service picks kafka but broker down | `JobReporter` buffers/retries; worker SLA timer still fires as backstop |
