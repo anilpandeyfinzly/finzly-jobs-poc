@@ -1,39 +1,24 @@
 version: "3.9"
 
+# Local development stack.
+#
+# PostgreSQL is intentionally NOT managed here — the application connects to the
+# external `test3` Postgres via its existing config (config_url in .env). Only
+# Kafka runs locally.
+
 services:
-  postgres:
-    image: postgres:16
-    container_name: finzly-postgres
-    restart: unless-stopped
-
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: finzly
-
-    ports:
-      - "5432:5432"
-
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d finzly"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   # Single-node KRaft Kafka (no ZooKeeper), PLAINTEXT on localhost:9092.
   kafka:
     image: apache/kafka:3.8.1
     container_name: finzly-kafka
     restart: unless-stopped
     ports:
-      - "9092:9092"
+      - "9092:9092"   # client (host) listener
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      # Advertised to clients — apps/demos on the host reach the broker at localhost:9092.
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
@@ -43,6 +28,23 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Persist commit logs to the named volume below.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - finzly-net
+    healthcheck:
+      # Broker answers an API-versions request once it's fully up.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+networks:
+  finzly-net:
+    driver: bridge
 
 volumes:
-  postgres_data:
+  kafka_data:
