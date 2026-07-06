@@ -26,7 +26,7 @@ so the same code can later be split across pods/services unchanged.
 
 ## 2. Data model
 
-Schema `demo_galaxy_jobs` (migration `0003_flow_model.sql`). All timestamps are
+Schema `demo_galaxy_jobs` (migration `0001_jobs_poc_ddl.sql`). All timestamps are
 `TIMESTAMP` (no time zone); structured columns are `JSONB`; keys/FKs are `UUID`.
 
 ```
@@ -135,4 +135,7 @@ flip `flow_execution` FAILED→RUNNING, publish `job.execution.requested`.
 - [ ] Redis heartbeat + crash-detection sweep (§4.6).
 - [ ] Resume endpoint (§4.7).
 - [ ] Delayed delivery for future-dated fires (Kafka SDK has no native delay).
-- [ ] Enable migrations at boot (`migration_enabled()` is hard-coded `false`).
+
+> **Note:** the base schema (`demo_galaxy_jobs`) must exist before boot — the SDK
+> sets it as the connection `search_path` and creates the migration ledger there.
+> Provision it out-of-band (`CREATE SCHEMA IF NOT EXISTS demo_galaxy_jobs;`).

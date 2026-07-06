@@ -100,5 +100,5 @@ fn migration_enabled() -> bool {
     //         v == "true" || v == "1"
     //     })
     //     .unwrap_or(false)
-    false
+    true
 }
