@@ -8,6 +8,17 @@ result back to the orchestrator.
 This mirrors how services embed `phoenix-workflow-client` today (a process-global
 runtime you register handlers into, then start).
 
+## Two integration styles — pick per job/service
+
+| Style | Dispatch | Who runs the job | How completion is reported |
+|---|---|---|---|
+| **A. Embedded worker** (EVENT) | Kafka `job-dispatch-<ctx>` | the SDK, in your process (`Job::execute`) | SDK reports **automatically** |
+| **B. Fire-and-callback** (API) | orchestrator HTTP-`POST`s your endpoint; you **202-ack** and work async | your own code / another system | **you** call `JobReporter` when done — over **Kafka or HTTP**, your choice |
+
+Style A is turnkey (write a `Job`, register it). Style B is for work that outlives the
+request — you ack immediately, then push a terminal result back later via the
+`JobReporter` helper (§4.5). Both use the same SDK; a service can use both.
+
 ---
 
 ## 1. What the SDK gives you vs. what you write
@@ -62,9 +73,13 @@ finzly.jobs.service.context=settlement-service
 spring.kafka.bootstrap-servers=localhost:9092
 spring.kafka.properties.security-protocol=PLAINTEXT     # PLAINTEXT locally; SSL in prod
 
-# Redis (heartbeat)
+# Redis (heartbeat — Style A embedded worker)
 bankos.redis.cache.common.member.ip=localhost
 bankos.redis.cache.common.member.port=6379
+
+# Reporting transport (Style B) — how you push results back to the orchestrator
+finzly.jobs.report.transport=kafka                 # or: http
+finzly.jobs.orchestrator.base-url=https://finzly-jobs.internal   # required when transport=http
 
 # Postgres per-tenant (only if your jobs query the DB)
 bankos.tenants=banka,bankb
@@ -132,6 +147,45 @@ A panic or an `Err` bubbling out is treated as `failure` — but prefer returnin
 `JobResult::failure` with a clear reason.
 
 ---
+
+## 4.5 Reporting results back — `JobReporter` (Style B)
+
+When your service does the work asynchronously (you got a fire + acked, or you run the
+job on your own schedule), report the outcome with the `JobReporter` helper. **You pick
+the transport** — Kafka or an HTTP callback to the job-service — with one config key;
+the SDK has both wired.
+
+```properties
+finzly.jobs.report.transport=kafka          # or: http
+finzly.jobs.orchestrator.base-url=https://finzly-jobs.internal   # required for http
+```
+
+```rust
+use finzly_jobs_sdk::{JobReporter, JobHandle};
+
+// `handle` is delivered to you in the dispatch (HTTP body or event); echo it back.
+async fn on_settlement_done(handle: JobHandle, outcome: Result<String, String>) {
+    let reporter = JobReporter::from_config().expect("reporter");
+    match outcome {
+        Ok(output) => { let _ = reporter.success(&handle, output).await; }
+        Err(reason) => { let _ = reporter.failure(&handle, reason).await; }
+    }
+}
+
+// optional progress / liveness pushes (FIXED_TIME or COMPOSITIONAL cadence):
+reporter.progress(&handle, "phase 2/3: posting entries").await?;
+```
+
+- `success` / `failure` are **terminal** — send exactly one.
+- `progress` is optional; it refreshes the job's liveness (`last_report_at`) so a
+  long-running API job isn't flagged as timed-out. If you never report progress, the
+  job must still finish within `timeoutSeconds` or the orchestrator marks it TIMED_OUT.
+- The reporter **retries/buffers** on transient transport failure, so a brief broker or
+  orchestrator outage doesn't lose your result. Reports are idempotent on the receiving
+  side, so a retry is safe.
+
+> Style A (embedded worker, §5) calls `JobReporter` for you after `Job::execute` — you
+> only touch it directly for Style B.
 
 ## 5. Register and start (in `main`)
 
@@ -237,12 +291,25 @@ pub struct JobContext { pub tenant: String, pub flow_execution_id: Uuid,
 pub enum JobResult { Success { output: Option<String> }, Failure { reason: String } }
 impl JobResult { pub fn success(_: impl Into<String>) -> Self; pub fn failure(_: impl Into<String>) -> Self; }
 
-pub struct JobRuntime { /* ... */ }
+pub struct JobRuntime { /* ... */ }              // Style A: embedded worker
 impl JobRuntime {
     pub fn from_config() -> Result<Self>;                       // reads finzly.jobs.service.context + infra
     pub fn new(kafka: KafkaConfig, service_context: &str) -> Self;
     pub fn register<J: Job + 'static>(&mut self, job: J) -> &mut Self;
     pub async fn start(self) -> Result<()>;                     // runs the consumer loop
+}
+
+pub struct JobHandle {                            // correlation id, delivered at dispatch
+    pub job_execution_id: Uuid, pub flow_execution_id: Uuid,
+    pub tenant: String, pub service_context: String, pub job_name: String,
+}
+pub struct JobReporter { /* ... */ }             // Style B: report async results back
+impl JobReporter {
+    pub fn from_config() -> Result<Self>;                       // finzly.jobs.report.transport = kafka|http
+    pub async fn running(&self,  h: &JobHandle) -> Result<()>;
+    pub async fn progress(&self, h: &JobHandle, note: &str) -> Result<()>;
+    pub async fn success(&self,  h: &JobHandle, output: impl Into<String>) -> Result<()>;
+    pub async fn failure(&self,  h: &JobHandle, reason: impl Into<String>) -> Result<()>;
 }
 ```
 
