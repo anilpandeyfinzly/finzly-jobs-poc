@@ -4,6 +4,7 @@
 //! migrations, then serve an axum app. Feature logic lives in its own modules
 //! (see `registration`).
 
+mod api;
 mod kafka;
 mod registration;
 mod scheduler;
@@ -71,7 +72,8 @@ async fn async_main() -> Result<(), String> {
     // 7. Axum server — feature routers are merged in here.
     let app = Router::new()
         .route("/ping", get(ping))
-        .merge(registration::router());
+        .merge(registration::router())
+        .merge(api::router());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     let listener = tokio::net::TcpListener::bind(addr)
