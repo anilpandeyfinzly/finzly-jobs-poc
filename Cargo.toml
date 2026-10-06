@@ -3,7 +3,7 @@ name = "finzly-jobs-poc"
 version = "0.3.0"
 edition = "2024"
 publish = ["finzly-finzly-rust-hosted"]
-
+#finzly test
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["multipart"] }

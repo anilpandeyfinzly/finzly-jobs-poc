@@ -4,13 +4,16 @@ Proof of concept for the new **finzly-job-service**: a multi-tenant, cron-driven
 Kafka-orchestrated job/flow scheduler. This document is the reference for the data
 model, the message topics, and the end-to-end flows.
 
-> **Scope update (2026):** the system was split into a **Scheduler** (WHEN), a separate
-> **Orchestrator** (assignment/flow/execution), and **Worker = Host Service + Client
-> SDK**. **This POC now implements only the Scheduler Service** — cron `scheduled_trigger`
-> rows → a `finzly.jobs.trigger.due` Kafka event (via a transactional outbox). Flow/job
-> definitions, dispatch, concurrency, execution tracking, workers, and the SDK described
-> below are the **Orchestrator** (separate service, not in this POC). See
-> [ARCHITECTURE.md](ARCHITECTURE.md) and [LOW-LEVEL-DESIGN.md](LOW-LEVEL-DESIGN.md).
+> **Scope update (2026):** the system was split into a **Scheduler**, a separate
+> **Orchestrator** (assignment/flow execution/concurrency), and **Worker = Host Service
+> + Client SDK**. **This POC is the Scheduler Service** — the **control plane**: it owns
+> the catalog (project / job / flow definitions) + schedules, serves the UI read APIs
+> (`GET /projects /jobs /flows /schedules /history/{flows,jobs}`), polls due triggers
+> every 5s, and publishes a `finzly.jobs.trigger.due` event (via a transactional outbox).
+> Execution **history** rows are written by the Orchestrator and only *read* here.
+> **Dispatch, concurrency (SKIP/QUEUE/PARALLEL), the worker, and the SDK are the
+> Orchestrator** (separate service, not in this POC). See [ARCHITECTURE.md](ARCHITECTURE.md)
+> and [LOW-LEVEL-DESIGN.md](LOW-LEVEL-DESIGN.md).
 
 ---
 
